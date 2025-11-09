@@ -4,7 +4,7 @@ import { createAppKit } from "@reown/appkit/react";
 import { WagmiAdapter } from "@reown/appkit-adapter-wagmi";
 import { celo } from "@reown/appkit/networks";
 
-const projectId = "cd169b99d42633d1d81f5aee613d0eed";
+const projectId = "cd169b99d42633d1d81f5aee613d0eed"; // get from reown.com
 
 export const wagmiAdapter = new WagmiAdapter({
   projectId,
