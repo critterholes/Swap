@@ -3,10 +3,9 @@ import { useState, useEffect, useMemo } from 'react';
 import {
   useAccount,
   useBalance,
-  useContractRead,
-  useContractWrite,
-  useWaitForTransaction,
-  usePrepareContractWrite,
+  useReadContract,
+  useWriteContract,
+  useWaitForTransactionReceipt,
 } from 'wagmi';
 import { parseUnits, formatUnits } from 'viem';
 import {
@@ -31,6 +30,13 @@ export function useSwapKiosk() {
   const [mode, setMode] = useState<SwapMode>('buy');
   const [amountIn, setAmountIn] = useState(''); // The raw string input from the user
   const [amountOut, setAmountOut] = useState(''); // The calculated, formatted output string
+  
+  // FIX 3: We need a local state for the txHash.
+  const [txHash, setTxHash] = useState<`0x${string}` | undefined>();
+  
+  // We still use a manual state for 'isApproving' to show a specific "Approving..." message
+  const [isApproving, setIsApproving] = useState(false);
+
 
   // --- Wagmi Account State ---
   const { address } = useAccount();
@@ -42,52 +48,45 @@ export function useSwapKiosk() {
   const outputDecimals = mode === 'buy' ? CHP_DECIMALS : USDC_DECIMALS;
 
   // --- Memoized BigInt Conversion ---
-  // Convert the user's string input into a BigInt for calculations
   const amountInBigInt = useMemo(() => {
     if (!amountIn) return 0n;
     try {
       return parseUnits(amountIn, inputDecimals);
     } catch {
-      return 0n; // Handle invalid input (e.g., "1.2.3")
+      return 0n; // Handle invalid input
     }
   }, [amountIn, inputDecimals]);
 
   // --- 1. DATA FETCHING (Wagmi Reads) ---
 
-  // Fetch the 1000_CHP : 1_USDC buy price
-  const { data: buyPrice } = useContractRead({
+  const { data: buyPrice } = useReadContract({
     address: CHSWAP_ADDRESS,
     abi: chSwapAbi,
     functionName: 'buyPricePer1000CHP_USDC',
-    watch: true, // Automatically refetch if price changes
   });
 
-  // Fetch the 1000_CHP : 0.7_USDC sell price
-  const { data: sellPrice } = useContractRead({
+  const { data: sellPrice } = useReadContract({
     address: CHSWAP_ADDRESS,
     abi: chSwapAbi,
     functionName: 'sellPricePer1000CHP_USDC',
-    watch: true,
   });
 
-  // Fetch user's balance of the INPUT token
-  const { data: inputBalance } = useBalance({ address, token: inputToken, watch: true });
-  // Fetch user's balance of the OUTPUT token
-  const { data: outputBalance } = useBalance({ address, token: outputToken, watch: true });
+  const { data: inputBalance } = useBalance({ address, token: inputToken });
+  const { data: outputBalance } = useBalance({ address, token: outputToken });
 
-  // Check how much the user has already approved our contract to spend
-  const { data: allowance, refetch: refetchAllowance } = useContractRead({
+  const { data: allowance, refetch: refetchAllowance } = useReadContract({
     address: inputToken,
     abi: erc20Abi,
     functionName: 'allowance',
     args: [address!, CHSWAP_ADDRESS],
-    enabled: !!address, // Only run if wallet is connected
+    // FIX 1: `enabled` must go inside the `query` object
+    query: {
+      enabled: !!address, // Only run if wallet is connected
+    }
   });
 
   // --- 2. OUTPUT CALCULATION ---
   
-  // Calculate the fee amount for the 'sell' operation
-  // The contract requires 1% extra CHP to be approved
   const feeAmountBigInt = useMemo(() => {
     if (mode === 'sell' && amountInBigInt > 0n) {
       return (amountInBigInt * 1n) / 100n; // 1% fee
@@ -95,15 +94,12 @@ export function useSwapKiosk() {
     return 0n;
   }, [mode, amountInBigInt]);
 
-  // Determine the total amount to approve
   const amountToApproveBigInt = mode === 'buy' 
-    ? amountInBigInt // For 'buy', approve the exact USDC amount
-    : amountInBigInt + feeAmountBigInt; // For 'sell', approve CHP + 1% fee
+    ? amountInBigInt 
+    : amountInBigInt + feeAmountBigInt;
 
-  // Check if the user needs to approve more tokens
   const needsApproval = (allowance ?? 0n) < amountToApproveBigInt;
 
-  // This effect calculates the `amountOut` whenever the input changes
   useEffect(() => {
     if (amountInBigInt === 0n || (!buyPrice && !sellPrice)) {
       setAmountOut('');
@@ -112,11 +108,9 @@ export function useSwapKiosk() {
 
     let out = 0n;
     if (mode === 'buy' && buyPrice) {
-      // Buy: (usdcIn * 1000) / price
       const chpOut = (amountInBigInt * 1000n) / buyPrice;
       out = chpOut - (chpOut / 100n); // Subtract 1% fee
     } else if (mode === 'sell' && sellPrice) {
-      // Sell: (chpIn * price) / 1000
       out = (amountInBigInt * sellPrice) / 1000n;
     }
 
@@ -125,68 +119,52 @@ export function useSwapKiosk() {
 
   // --- 3. TRANSACTION PREPARATION (Wagmi Writes) ---
 
-  const [txHash, setTxHash] = useState<`0x${string}`>();
-  const [isApproving, setIsApproving] = useState(false); // Manually track approve loading
-
-  // A. Prepare the 'approve' transaction
-  const { config: approveConfig } = usePrepareContractWrite({
-    address: inputToken,
-    abi: erc20Abi,
-    functionName: 'approve',
-    args: [CHSWAP_ADDRESS, amountToApproveBigInt],
-    enabled: needsApproval && amountInBigInt > 0n,
-  });
-  const { writeAsync: approve } = useContractWrite(approveConfig);
-
-  // B. Prepare the 'buyCHP' transaction
-  const { config: buyConfig } = usePrepareContractWrite({
-    address: CHSWAP_ADDRESS,
-    abi: chSwapAbi,
-    functionName: 'buyCHP',
-    args: [amountInBigInt], // Pass the USDC amount
-    enabled: mode === 'buy' && !needsApproval && amountInBigInt > 0n,
-  });
-  const { writeAsync: buyCHP } = useContractWrite(buyConfig);
-
-  // C. Prepare the 'sellCHP' transaction
-  const { config: sellConfig } = usePrepareContractWrite({
-    address: CHSWAP_ADDRESS,
-    abi: chSwapAbi,
-    functionName: 'sellCHP',
-    args: [amountInBigInt], // Pass the CHP amount
-    enabled: mode === 'sell' && !needsApproval && amountInBigInt > 0n,
-  });
-  const { writeAsync: sellCHP } = useContractWrite(sellConfig);
-
-  // D. Wait for any transaction to be confirmed
-  const { isLoading: isConfirming } = useWaitForTransaction({
+  // Get the main write function and its loading state
+  const { isPending, writeContractAsync } = useWriteContract();
+  
+  // FIX 2: `useWaitForTransactionReceipt` no longer takes `onSuccess`.
+  // We get its status and use `useEffect` to react to it.
+  const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({
     hash: txHash,
-    onSuccess: () => {
-      // Reset state after success
-      setTxHash(undefined);
-      setAmountIn('');
-      setIsApproving(false);
-      refetchAllowance(); // Re-check allowance
-    },
   });
+
+  // This effect runs when the transaction is confirmed
+  useEffect(() => {
+    if (isConfirmed) {
+      setTxHash(undefined); // Clear the hash
+      setAmountIn(''); // Reset input
+      setIsApproving(false); // Reset approving state
+      refetchAllowance(); // Re-check allowance
+    }
+  }, [isConfirmed, refetchAllowance]);
+
 
   // --- 4. ACTION HANDLER ---
 
-  // This function is called when the main button is clicked
   const handleSubmit = async () => {
     if (amountInBigInt === 0n) return;
-    setTxHash(undefined);
+    setTxHash(undefined); // Clear any old hash
 
     try {
       if (needsApproval) {
         setIsApproving(true);
-        const tx = await approve?.();
-        if (tx) setTxHash(tx.hash);
+        // FIX 3: Call `setTxHash` with the hash returned from the async call
+        const hash = await writeContractAsync({
+          address: inputToken,
+          abi: erc20Abi,
+          functionName: 'approve',
+          args: [CHSWAP_ADDRESS, amountToApproveBigInt],
+        });
+        if (hash) setTxHash(hash);
       } else {
-        let tx;
-        if (mode === 'buy') tx = await buyCHP?.();
-        if (mode === 'sell') tx = await sellCHP?.();
-        if (tx) setTxHash(tx.hash);
+        // FIX 3: Call `setTxHash`
+        const hash = await writeContractAsync({
+          address: CHSWAP_ADDRESS,
+          abi: chSwapAbi,
+          functionName: mode === 'buy' ? 'buyCHP' : 'sellCHP',
+          args: [amountInBigInt],
+        });
+        if (hash) setTxHash(hash);
       }
     } catch (e) {
       console.error(e);
@@ -195,9 +173,8 @@ export function useSwapKiosk() {
   };
 
   // --- 5. RETURN VALUES ---
-  // Expose all state and functions needed by the UI component
   
-  const isLoading = isApproving || isConfirming;
+  const isLoading = isPending || isApproving || isConfirming;
 
   return {
     // State
